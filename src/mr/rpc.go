@@ -6,24 +6,34 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-type ExampleArgs struct {
-	X int
+// request for workers acquire task from coordinator(master)
+type GetTaskReq struct {
 }
 
-type ExampleReply struct {
-	Y int
+// response for coordinator assign task to the worder
+type GetTaskRsp struct {
+	TaskType      TaskTypeEnum
+	TaskSeqNum    int // task sequence number starting from 0. if < 0, represent there is no TODO task this time
+	InputFileName string
+	NReduce       int // number of reduce task
+	NMap          int // number of map task
 }
 
-// Add your RPC definitions here.
+// request for workers submit completed task to coordinator(master)
+type HandinTaskReq struct {
+	TaskType   TaskTypeEnum
+	TaskSeqNum int // task sequence number starting from 0
+	// OutputFileName string
+}
 
+// response for coordinator recieved completed task
+type HandinTaskRsp struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.

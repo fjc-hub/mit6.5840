@@ -2,11 +2,10 @@ package kvsrv
 
 // Put or Append
 type PutAppendArgs struct {
-	Key   string
-	Value string
-	// You'll have to add definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Key        string
+	Value      string
+	ClientKey  string // half part of Idempotent Key using for duplicate detection
+	RequestKey int64  // half part of Idempotent Key using for duplicate detection
 }
 
 type PutAppendReply struct {

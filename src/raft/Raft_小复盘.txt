@@ -1,0 +1,135 @@
+1.为什么需要cadidate状态？
+    论文的一大目标：纯为了方便理解
+
+2.在“多数票决”的选举机制 + “允许不同节点任期号（TermId）不同”的特性 下，
+  存不存在“选举出多个不同任期Term的leader节点”的情况？
+    允许同时存在多个leader，但它们的任期一定不相同。
+    相当于分布式网络脑裂（split brain）产生了多个网络分区，每个分区有自己的leader
+    这种情况不会影响系统正确性，因为有“多数票决”机制，最多只有一个分区的操作可以获得多数票来提交操作
+    同时还有8.1这种纠错机制
+
+3.所谓raft kill是什么？
+    leader节点只能发不能收的极端网络情况下，leader可以发送heartbeat刷新其他节点的“发起新选举的计时器”
+    但是无法收到所有操作来自其他节点的vote，所以无法达成“多数投票”的提交commit条件，导致所有操作（选举，增加日志）
+    都无法完成，服务瘫痪
+
+4.注意“发起选举goroutine”，“选举投票handler”之间的死锁问题
+    发起选举的goroutine中需要加锁保护raft node的部分状态；选举投票的rpc handler中也需要安全访问共享的状态
+    这两个逻辑执行流是并发的，当raft node发起选举后收到一个RPC请求进入handler，不能让handler由于互斥无法继续执行
+    否则会导致多台服务器构成“死锁”循环等待
+
+？5.RequestVote handler为什么需要幂等（idempotent），需要保证何种程度的幂等？
+    此RPC接口如果不实现对相同<candidate候选人, term任期>的请求的幂等，此候选人可能由于超时重试发送多条RequestVote请求
+    从而在一个raft node上获得同一个任期的多张选票，最终可能导致出现多个同任期的leader
+
+    每个node的每个term都有一张选票，为什么只能投给比自身选举号更大的candidate？
+    使用voteFor实现这个机制可能使得老选举期的选票投多次，还有其他原因吗？
+
+——6.投票给candidate需要满足什么条件？这些条件用于维护什么？
+    限制条件：投给日志比自己更新的candidate节点：先比较log队列中最后一条log的任期号，再比较log队列的长度
+    产生效果：加了这个投票限制之后，只有拥有比半数节点更新（或一样新）日志的节点可以成为Leader；
+     还对【故障自动恢复】机制有影响：
+        老leader节点故障后，新leader不知道老leader节点log队列中哪些log已经提交并应用到raft保护的状态机上了 
+        新leader会将自身的log备份到followers，
+        只会出现新log覆盖其他follower节点中老log的情况，避免老log覆盖新log
+
+——7.只限制“投票给log更长节点” 不先比较最后一个log的任期号会产生什么问题？
+
+
+*8.代码实现中需要Double-Check（此说法灵感来自本人对DCL设计模式的理解）的场景有哪些？
+        并发编程时需要注意获取多把锁的场景或这类逻辑流：比如持有一把锁仍然尝试获取另一把锁，
+    这可能发生在一个函数内外（甚至是一个本地函数和远程函数上，通过RPC把handler函数和本地串到一个逻辑流中）。
+        将原本的共享变量访问块（临界区）分成多块时，后面的块可能使用前面块中保存自共享变量的临时变量，不能使用这类临时变量
+    因为原来的共享变量可能在未持有锁的这段时间发生了变化，临时变量这个“副本”并不能感知到这个变化，可能造成“脏数据问题”
+        在leaderElection选举函数中，并发请求其他节点投票这个过程中没有加锁，所以这段时间内raft的状态、任期号都可能变化，
+    投票结束后会根据投票数更新raft节点的状态（共享），比如raft已经从candidate变为follower，任期号从term1变成了term2，
+    但获得了半数选票，如果不对之前的状态进行Double-Check，则会将raft状态变更为leader，从而让raft使用term1的选票晋升为term2的leader
+    （原过半数的投票结果只能说明raft可以当term1的leader），所以更新状态前需要检查raft当前的term任期号。raft的状态可以不用校验是否为candidate
+
+    
+    8.1 选举纠错机制：一轮选举结束后，允许暂时出现多台raft都认为自己是Leader，允许它们发送新增日志RPC以及自己的心跳给其他节点，
+    当拥有高任期号的节点收到这些低任期号Leader的RPC消息时，会将自己的任期号响应给这些leader，最后它们会从leader退回到follower。
+    这种纠错机制建立在：每次raft之间的通信都会交换term任期号，收到低任期号消息的raft不会执行操作，收到高任期号的raft会修改自身各种状态！！！
+    
+    8.2 灵感来源如下（摘抄自lab手册 https://pdos.csail.mit.edu/6.824/labs/raft-locking.txt）
+        Rule 5: Be careful about assumptions across a drop and re-acquire of a
+        lock. One place this can arise is when avoiding waiting with locks
+        held. For example, this code to send vote RPCs is incorrect:
+
+        rf.mu.Lock()
+        rf.currentTerm += 1
+        rf.state = Candidate
+        for <each peer> {
+            go func() {
+            rf.mu.Lock()
+            args.Term = rf.currentTerm
+            rf.mu.Unlock()
+            Call("Raft.RequestVote", &args, ...)
+            // handle the reply...
+            } ()
+        }
+        rf.mu.Unlock()
+
+        The code sends each RPC in a separate goroutine. It's incorrect
+        because args.Term may not be the same as the rf.currentTerm at which
+        the surrounding code decided to become a Candidate. Lots of time may
+        pass between when the surrounding code creates the goroutine and when
+        the goroutine reads rf.currentTerm; for example, multiple terms may
+        come and go, and the peer may no longer be a candidate. One way to fix
+        this is for the created goroutine to use a copy of rf.currentTerm made
+        while the outer code holds the lock. Similarly, reply-handling code
+        after the Call() must re-check all relevant assumptions after
+        re-acquiring the lock; for example, it should check that
+        rf.currentTerm hasn't changed since the decision to become a
+        candidate.
+    
+
+9.candidate节点每次发起选举时为什么要重置“新选举计时器”？
+    如果本次选举没有产生leader，最好不要马上开始下一轮选举，所以重置计时器
+    带随机化的重置 有利于错开各个节点的选举计时器过期时间点，减少分票split-vote的出现。
+    计时器使用下一次选举执行时间（expire逻辑）表达，比使用“上一次心跳时间”更好写代码
+
+*10.使用Go中WaitGroup的弊端
+    Wait操作必须等待内部计数器归零才能返回。在代码里使用了它来实现并发地发送RPC，在最坏的情况下wait的goroutine
+    需要等待一半的raft服务器超时才能返回，如果上层函数依赖这个返回才进行后续代码，比如可能会delay下一轮心跳，导致出现Leader未故障
+    但仍发生新的、更高term任期号的选举。Leader没有压制住其他节点发起选举。
+        P.S.在一些不需要等待全部任务都完成的场景使用了这个东西,导致等待时间过长，后面的任务被长时间延期。
+    比如leader当前这轮心跳还没有发完（收到全部peers的答复）下一轮心跳的时间已经到了，由于上一轮心跳发送任务占用了CPU，当前轮次任务
+    发不出去，造成leader无法suppress抑制其他节点发起选举。
+        再比如之前选举时使用了WaitGroup来同步所有RequestVote请求完成后再判断票数、判断是否有更新的term，这导致在网络不稳定太多RPC
+    请求超时的情况下，同步需要花很长的时间，进而整个选举耗时超过其他节点的“选举计时器”：
+         A节点发起任期T的选举                                                    B节点开始任期T+1的选举
+                |                                                <<==发送T+1的RequestVote=|
+      检测到更新的任期号term T+1                                                           |
+       回退到Follower状态                                                                  | 
+                |=将T+1任期的票投给B==>>                                                   |
+                |                                                                         |
+                |                                                                         |
+          选举计时器过期                                                                    |
+         发起T+1任期的选举                                                                  | 
+                |=发送T+2的RequestVote==>>                                                 |
+                |                                                            检测到检测到更新的任期号term T+2
+                |                                                                回退到Follower状态 
+                |                                                    <<==将T+2任期的票投给A=|
+                |                                                                          |
+                |                                                                    选举计时器过期 
+                |                                                                   发起T+3任期的选举
+                |                                                  <<==发送T+3的RequestVote=|
+                |                                                                          |
+                |                                                                          |
+      检测到更新的任期号term T+3                                                             |
+       回退到Follower状态                                                                   |
+                |=将T+3任期的票投给B==>>                                                    |
+                |                                                                          |
+          选举计时器过期                                                                    |
+         发起T+1任期的选举                                                                  |
+                |=发送T+2的RequestVote==>>                                                  |
+                |                                                                          |
+
+    上图是一个只有两个节点的网络，可以看到每个raft节点在收到足够的投票后没有即使结束选举并发送心跳给其他节点（造成这种情况的原因有很多，
+    比如上文提到的candidate节点使用wg等待所有raft回送RPC消息，包括故障无法处理RPC的raft），投过票的节点等不到刷新计数器的heartbeat
+    便发起新一轮的选举，上一轮中获得足够半数选票的节点检测到更新的任期号自动回退为follower，如此往复，选不出Leader
+
+
+11.注意活锁livelock问题
+    see see 第10点

@@ -1,5 +1,39 @@
-1.为什么需要cadidate状态？
-    论文的一大目标：纯为了方便理解
+0.注意思考在Leader选举、日志备份这些功能上，Raft为什么要这样设计，这样实现比传统方式/暴力方式好在哪里。对比性理解
+
+——1.Raft思想介绍
+    本质：
+        一种consensus algorithm、一个过半投票（quorum）系统，在任何时候为了完成任何操作，你必须凑够过半的服务器来批准相应的操作。
+    
+    quorum特性：
+        ① 避免脑裂：最多只有一个网络分区会有过半的服务器，所以我们不可能有两个分区可以同时完成操作
+        ② 过半交集（majority intersection）：
+            假设有一系列操作需要完成，其中每一个操作都需要过半的节点批准，那么任意两个已完成的操作
+            至少有一个节点知道这两个操作，即有一个重叠的节点。
+            投票支持下一个操作的节点中，必然能找到之前的所有操作。
+    
+  **1.666 过半投票特性在Raft中的应用（可参考下文6.）
+        一系列操作有两种：选举leader；leader日志备份到follower
+
+        旧Leader“日志备份”操作需要获得过半raft节点同意后才能完成，那么必然有过半的raft节点保存了它的‘所有’日志，
+        后续同意新Leader当选的过半节点中，也至少一个备份了旧leader的日志（即包含了旧Leader的‘所有’日志）
+        两个过半集合中至少有一个重叠的节点
+
+        Raft协议通过在Leader选举过程和日志备份过程增加限制，确保新leader只会是包含了旧leader所有日志的节点（参考22.Leader Completeness Property）
+        其他共识算法可能允许任意节点当选，但新Leader需要与过半投票节点通信，从中找到包含旧leader所有日志的节点
+
+        raft leader每次向follower备份日志时，虽然在RPC中只包含了日志数组的一个后缀，但是只有两份日志
+        数组完全一致时，follower才会同意这次“日志备份”操作，这要求除后缀外的前缀也是相同的，隐式提交。
+        raft通过Log Matching特性来实现这种‘快速’的日志备份机制
+
+    raft协议核心功能 CAP Theorem？
+        - 一致性：
+            ① 实现强一致性，客户端发送的操作以相同的顺序在集群中不同节点上执行，未提交的操作都不执行
+        
+        - 可用性：
+            ① 只要集群中不低于半数的raft节点之间能正常通信 那么就能正常对外服务。允许少部分机器故障
+            ② 自动故障恢复，即使唯一的Leader节点crash，只要满足①，就能自动选举出新Leader
+
+        - 分区容忍：
 
 2.在“多数票决”的选举机制 + “允许不同节点任期号（TermId）不同”的特性 下，
   存不存在“选举出多个不同任期Term的leader节点”的情况？
@@ -18,25 +52,34 @@
     这两个逻辑执行流是并发的，当raft node发起选举后收到一个RPC请求进入handler，不能让handler由于互斥无法继续执行
     否则会导致多台服务器构成“死锁”循环等待
 
-？5.RequestVote handler为什么需要幂等（idempotent），需要保证何种程度的幂等？
+5.RequestVote handler为什么需要幂等（idempotent），需要保证何种程度的幂等？
     此RPC接口如果不实现对相同<candidate候选人, term任期>的请求的幂等，此候选人可能由于超时重试发送多条RequestVote请求
-    从而在一个raft node上获得同一个任期的多张选票，最终可能导致出现多个同任期的leader
+    从而在一个raft node上获得同一个任期的多张选票，最终可能导致出现多个同任期的leader。
+    这也是为什么持久化要保存voteFor和currentTerm这两个状态的主要原因（这两个参数唯一确定一张选票，要防止这张vote投给不同raft）
 
-    每个node的每个term都有一张选票，为什么只能投给比自身选举号更大的candidate？
-    使用voteFor实现这个机制可能使得老选举期的选票投多次，还有其他原因吗？
+——*6.投票给candidate需要满足什么条件？这些条件用于维护什么？
+    限制条件：只能投给日志 “at least up to date than me” 的节点：先比较log队列中最后一条log的任期号大小，再比较log队列的长度.
+    产生效果：加了这个投票限制和“leader不提交旧leader的log”，保证新选出Leader的Logs中包含所有已经Committed的日志（论文中称为Leader Completeness Property）
+    
+    6.1 直观解释1：
+        如果不加限制，那么不包含任何日志的节点都可能成为Leader。
+        容易造成Committed日志的丢失，
+        为了保证Committed日志不丢失，Raft协议要求（其他协议有其他方案）：保存了所有已经Committed日志的节点才能成为新Leader
+        实现这一点要求只需在投票时加上这个限制，再加上最基本的“多数票决”机制，就能保证新Leader保存了之前所有已经Committed日志
+        
+    *6.2 直观解释2：（灵感来源1.）
+        - 假设一个集群2n+1台节点，最初的1号Leader故障了，需要选举，选举前就至少有n+1个节点保存了所有Committed Logs（最后一条log保存需要前面的log都保存了才会返回accept给Leader）
+        - 第二个新Leader想要选举成功，必然要获得至少一个“保存了所有Committed-Logs的节点”的同意！！！
+        - 限制这个至少一个的“保存了所有Committed-Logs的节点”同意投票的逻辑，即可保证新Leader保存了所有已提交日志
+        - 循环下去，无论Leader更换多少次，新Leader总包含所有已经提交的Log。
+    有些共识算法可能允许任何节点成为Leader，只不过新Leader上任后需要先找到投票给自己的所有节点中找到保存了所有Committed Logs
+    的节点（至少有一个），然后从它们哪里拿到所有已提交的日志。只不过raft为了减少RPC选择加限制而已
 
-——6.投票给candidate需要满足什么条件？这些条件用于维护什么？
-    限制条件：投给日志比自己更新的candidate节点：先比较log队列中最后一条log的任期号，再比较log队列的长度
-    产生效果：加了这个投票限制之后，只有拥有比半数节点更新（或一样新）日志的节点可以成为Leader；
-     还对【故障自动恢复】机制有影响：
-        老leader节点故障后，新leader不知道老leader节点log队列中哪些log已经提交并应用到raft保护的状态机上了 
-        新leader会将自身的log备份到followers，
-        只会出现新log覆盖其他follower节点中老log的情况，避免老log覆盖新log
 
-——7.只限制“投票给log更长节点” 不先比较最后一个log的任期号会产生什么问题？
+7.只限制“投票给log更长节点” 不先比较最后一个log的任期号会产生什么问题？
+    这样无法保证“Leader Completeness Property”，如果选出缺少已提交日志的leader 会造成raft之间状态机状态永远无法一致
 
-
-*8.代码实现中需要Double-Check（此说法灵感来自本人对DCL设计模式的理解）的场景有哪些？
+8.代码实现中需要Double-Check（此说法灵感来自本人对DCL设计模式的理解）的场景有哪些？
         并发编程时需要注意获取多把锁的场景或这类逻辑流：比如持有一把锁仍然尝试获取另一把锁，
     这可能发生在一个函数内外（甚至是一个本地函数和远程函数上，通过RPC把handler函数和本地串到一个逻辑流中）。
         将原本的共享变量访问块（临界区）分成多块时，后面的块可能使用前面块中保存自共享变量的临时变量，不能使用这类临时变量
@@ -46,7 +89,6 @@
     但获得了半数选票，如果不对之前的状态进行Double-Check，则会将raft状态变更为leader，从而让raft使用term1的选票晋升为term2的leader
     （原过半数的投票结果只能说明raft可以当term1的leader），所以更新状态前需要检查raft当前的term任期号。raft的状态可以不用校验是否为candidate
 
-    
     8.1 选举纠错机制：一轮选举结束后，允许暂时出现多台raft都认为自己是Leader，允许它们发送新增日志RPC以及自己的心跳给其他节点，
     当拥有高任期号的节点收到这些低任期号Leader的RPC消息时，会将自己的任期号响应给这些leader，最后它们会从leader退回到follower。
     这种纠错机制建立在：每次raft之间的通信都会交换term任期号，收到低任期号消息的raft不会执行操作，收到高任期号的raft会修改自身各种状态！！！
@@ -87,7 +129,9 @@
 9.candidate节点每次发起选举时为什么要重置“新选举计时器”？
     如果本次选举没有产生leader，最好不要马上开始下一轮选举，所以重置计时器
     带随机化的重置 有利于错开各个节点的选举计时器过期时间点，减少分票split-vote的出现。
-    计时器使用下一次选举执行时间（expire逻辑）表达，比使用“上一次心跳时间”更好写代码
+    计时器使用下一次选举执行时间（expire逻辑）表达，比使用“上一次心跳时间”更好写代码。
+    同一个raft节点可能后台有多个不同term的选举goroutine，每次RPC收到答复后都要Double-Check当前状态和RPC前的状态，
+    以决定答复是否有效
 
 *10.使用Go中WaitGroup的弊端
     Wait操作必须等待内部计数器归零才能返回。在代码里使用了它来实现并发地发送RPC，在最坏的情况下wait的goroutine
@@ -130,6 +174,111 @@
     比如上文提到的candidate节点使用wg等待所有raft回送RPC消息，包括故障无法处理RPC的raft），投过票的节点等不到刷新计数器的heartbeat
     便发起新一轮的选举，上一轮中获得足够半数选票的节点检测到更新的任期号自动回退为follower，如此往复，选不出Leader
 
-
 11.注意活锁livelock问题
     see see 第10点
+
+12.为什么上层应用向Raft投递命令要使用非阻塞non-blocking的方式（调用Start投递日志后立即返回）？
+    raft需要把log备份到多数节点上才会返回客户端的请求，耗时比较长。
+    采用“消息队列”的形式可以解耦raft和上层应用
+
+
+13.日志结构
+                                  rf.LastApplied                        rf.CommitIndex
+    |--------Committed, Applied---------|---------Committed, Unapplied---------|-----Uncommitted-------|
+    [<---已经提交并应用到状态机上的log--->][<---已经提交还未应用到状态机上的log--->][<---未提交的临时日志--->]
+    
+14.leader节点备份replicate自身日志给follower节点时，对follower节点保存了多少日志，有多少与自己相同
+   以及“第一条与leader不同的日志的索引号”都是未知的。leader需要多次调用appendLog多次尝试来确定上述问题 并发送follower真正缺失的部分。
+   leader是从第一条log开始or从中间某个位置or从最后一条log开始尝试呢？（目的是找到第一条不同的日志，然后发送后续所有日志给follower备份）
+     从第一条开始，如果系统运行了很长时间，遍历比较耗时，从最后一条开始开始，如果follower落后leader太多依旧比较耗时
+     从某一个位置开始比较好，由leader为每个follower都维护一个位置，后续同步从这个位置向前查找第一条不同日志的index，对于一个稳定且
+     leader发生故障不多的系统是一个好方案（显然 leader发生故障后这个信息就丢失了，新leader需要从第一条或最后一条重新摸索）
+     
+15.leader发起的appendLogs操作获得多数投票后leader会在执行本地commit，但投票赞成的follower只是把这一批log赞存在自己log队列中还没有提交，
+   follower们等着leader提交后发送提交信号-ACK确认后才能提交。leader一般是把可提交RPC-ACK捆绑到“下一次”appendLogs请求中（ACK合并）
+   leader可以把ACK合并到心跳中吗？
+      可以，appendLogs和heartbeat请求唯一的区别是heartbeat中的不包含log，其他参数依旧传了，对同一个follower的日志备份和心跳操作
+      可以分配到同一个goroutine中处理
+
+16.为什么leader需要给每个node在后台开启一个单独的goroutine来执行Log Replication呢？
+    因为每个follower缺少的日志可能不同，与Leader的同步程度不同，比如一些节点和leader一样保存了1万条日志，少数节点一条日志都没有。
+    leader需要多次RPC才能确定每个节点保存了多少日志，从而确定Log Replication该从哪一条日志开始。因地制宜
+    而且根据集群中服务器数量一般不会太多，开goroutine无压力
+
+17.Raft如何保证Log Matching Property（参考原论文5.3和Figure 3）？
+        Log Matching Property是指任意两条备份在不同服务器上的日志，如果它们的term和index（在logs数组中的索引）一致，
+    则：它们保存了相同的命令，是同一条日志；且它们之前的日志也是相同的。
+        这个性质表明：①<term，index>唯一确定系统中的一条日志；②不同机器上备份的日志数组两两之间具有相同前缀。大大简化了leader日志备份任务
+    如何保证实现这条性质呢？
+        ①日志的<term，index>不可更改，一旦保存到Leader的logs数组中确定好顺序（index）号，在这个leader的任期内相同index不会再被分配出去
+        ②follower备份来自leader的日志前，先检查备份开始位置之前的日志是否和leader相同，如果相同才append/overwrite来自leader的这一批日志
+          只有前面日志相同的情况下，follower才允许对本地日志队列进行追加，所以从log队列为空开始“归纳”可以得出结论
+
+
+——18.Leader备份日志时，为什么不能提交previous term的日志（参考原论文5.4.2）？
+    任何限制条件都是： ！！！为了防止Leader覆盖follower中已经提交的日志！！！
+    因为新Leader刚上任无法“马上”确定非自己任期内收到log有没有被对应老Leader提交，存在各种可能：
+        1.这些log已经备份到多数节点上，Leader已经发送ACK向followers确认提交，也可能没有。这种情况下commit是安全的
+        2.这些log没有commit，只复制到少数节点上，这种情况下新leader可以丢弃这些logs，更没必要replicate并且commit
+    Raft协议允许在日志数组同一个索引使用term更大的log覆盖term更小的log，
+    如果允许Leader提交一些previous term的log，这些提交的log可能被
+
+    所以先不发ACK 直到收到currentTerm的log一起ACK
+
+    committed日志定义
+        原论文中的表述：A log entry is committed once the leader that created the entry has replicated it 
+        on a majority of the servers。
+        有一个subtle的点是：“he leader that created the entry”，创建/收到这条日志的Leader
+
+
+19.不需要等待RPC的场景有那些？
+    1.每一轮选举不要等，可能有一些响应特别慢的RPC大大增加了这一轮的耗时，从而影响下一个term选举的开始。
+    2.针对每个peer的每一轮日志备份（Logs Replication），即追加日志操作不要等，原因同上。
+    这些场景都可以开启一个后台goroutine来做，只需要注意在goroutine中增加Double-Check及时退出协程即可
+
+
+*20.为什么不需要持久化raft节点维护的commitIndex、lastApplied，经历crash-reboot后会不会由于没持久化lastApplied造成已提交的日志重复执行？
+    CommitIndex不需要持久化：重启后Leader可以通过获取其他节点的日志保存情况（matchIndex[]）慢慢确认日志提交点位置
+    LastApplied不需要持久化：每个Raft节点上的State Machine是易失性的Volatile，每次重启后需要从第一条log开始重放
+                            所以无需持久化。如果是非易失性Non-Volatile的应用（比如某种DB数据库），那么就可能需要考虑持久化了
+
+
+21.选举完成之后为啥要重置nextIndex[], matchIndex[]两个数组？
+    这两个是数组是Leader节点在它的任期内维护的每个节点的状态信息，随着leader与follower通信慢慢维护的变量。
+    nextIndex保存每个follower可能缺少的日志后缀位置，目的是用来加速日志备份，每次从末尾开始枚举follower缺少的日志后缀比较慢
+    matchIndex保存每个follower已经备份了leader log中前多少条日志，用来确定leader可以提交前多少条日志，一个变相vote计数器
+    节点的这两个状态可能在一个节点第一次成为Leader 和 第二次成为Leader这段时间中被其他Leader改变，后续安全使用可能需要额外检查
+
+*22.Leader Completeness Property？
+    Raft协议基于过半投票机制的性质（参考1.666）对Leader-Election过程和Log-Replication过程增加限制条件得到的特性
+    用于保证选举出来的新Leader一定包含所有已经提交的log。以便新Leader当选后无需发送一大堆RPC确定当前已提交的所有日志。
+
+    Leader-Election限制：选举leader时，节点只能投票给log比本地log更新或者一样新的候选节点。
+    Log-Replication限制：新Leader不能备份旧Leader的log到其他节点，也不能提交旧Leader的log。
+
+    log新旧判断：
+        以下图s0和s4为例，它们的日志分别为log[1,2,4]、log[1,3]，分别包含3、2条小日志/条目/entry
+        ·因为raft leader节点向follower节点备份日志时，只有日志中所以条目相同了才会投票给leader
+            即Log-Replication操作逻辑上是一个全量备份/同步，只不过log是数组，可以只发送follower部分缺失的后缀即可。
+        ·因为日志数组不支持插入/删除/修改，只允许append/overwrite（相当于给数组换一个后缀）
+        所以越新的日志，最后一个entry的term号更大，如果term相同，数组越长的log越长
+ 
+        从最后一条entry可以判断这两个log分别属于term为4、3的Leader。
+
+        index 0   1   2   3
+      node
+      _s0     1   2   4      
+       s1     1   2         
+       s2     1   2          
+       s3     1             
+      *s4     1   3          
+
+    假设如上状态：s4为leader，s0断连连接，term为5； 如果允许新leader s4备份或者提交旧leader的log会怎样
+        s4会使用旧日志log[1,3]覆盖s1/2节点的旧日志log[1,2]，而旧Leader可能提交了日志log[1,2]（允许s0在term=4时提交旧日志log[1,2]）
+        会使得已提交日志的部分条目被覆盖
+            
+
+    以s4为例，如果term为5时
+
+
+https://raft.github.io/

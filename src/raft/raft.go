@@ -20,12 +20,14 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -81,6 +83,8 @@ type Raft struct {
 								rf.LastApplied                           rf.CommitIndex
 		|------Committed, Applied------|----------Committed, Unapplied----------|-----Uncommitted-----|
 			  [1, rf.LastApplied]		   [rf.LastApplied+1, rf.CommitIndex]	  [rf.CommitIndex+1,)
+
+		committed logs represent itself has replicated on majority of raft servers
 	*/
 	logs        []*LogEntry
 	le          int   // length of logs, init 1
@@ -112,14 +116,13 @@ func (rf *Raft) GetState() (int, bool) {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.logs)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -127,19 +130,22 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var logs []*LogEntry
+	var currentTerm int
+	var votedFor int
+	if d.Decode(&logs) != nil ||
+		d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil {
+		panic("readPersist Decode error")
+	} else {
+		rf.le = len(logs)
+		rf.logs = logs
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -193,6 +199,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
 		rf.status = SFOLLOWER // leader and candidate node will not vote to any other candidates if it has higher term
+		rf.persist()
 
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
@@ -206,7 +213,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // AppendEntries RPC arguments structure.
 type AppendEntriesArgs struct {
 	Term         int
-	LeaderId     int
 	Entries      []*LogEntry // logs if can be appended
 	PrevLogTerm  int         // term of the log preceding Entries[0] in caller's logs queue
 	PrevLogIndex int         // index of the log preceding Entries[0] in caller's logs queue
@@ -220,6 +226,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	// optimization: accelerate to get longest identical prefix between leader logs array and follower logs array
+	XTerm  int // term in the conflicting entry (if exists)
+	XIndex int // index of first entry with that term (if exists)
+	XLen   int // log length
 }
 
 // AppendEntries RPC handler: remotely invoked by Leader to replicate log entries, also used as heartbeat
@@ -242,8 +253,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// check if logs in args can be appended/overwritten
 	if t := args.PrevLogIndex; !(0 <= t && t < rf.le) || rf.logs[t].Term != args.PrevLogTerm {
-		// args.Entries's previous log don't exits in follower's logs
-		// so can't append/overwrite args.Entries into follower's rf.logs[t+1:] sub-log
+		// not identical prefix between between leader logs array and follower logs array
+		// so can't append/overwrite leader's suffix as follower's suffix
+		reply.XLen = len(rf.logs)
+		if 0 <= t && t < rf.le {
+			reply.XTerm = rf.logs[t].Term
+			for i := t; i >= 0; i-- {
+				if rf.logs[i].Term != rf.logs[t].Term {
+					reply.XIndex = i + 1
+					break
+				}
+			}
+		}
 		goto reject_append
 	}
 	if rf.CommitIndex > args.LeaderCommit {
@@ -255,8 +276,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// accept to append/overwrite new logs
 	if len(args.Entries) > 0 {
-		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...) // save logs down to uncommited regeion
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...) // save logs down to uncommited region
 		rf.le = len(rf.logs)
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
@@ -291,6 +313,7 @@ func (rf *Raft) recvNewTerm(term int) {
 	rf.currentTerm = term
 	rf.status = SFOLLOWER
 	rf.votedFor = -1
+	rf.persist()
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -318,6 +341,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.logs = append(rf.logs, &LogEntry{Term: term, Command: command})
 	index := rf.le
 	rf.le++
+	rf.persist()
 
 	return index, term, isLeader
 }
@@ -351,6 +375,7 @@ func (rf *Raft) ticker() {
 			rf.status = SCANDIDATE
 			rf.votedFor = rf.me
 			rf.currentTerm++
+			rf.persist()
 			rf.expiredTime = randTimestamp() // reset election timer after quit this election
 
 			var (
@@ -404,7 +429,7 @@ func (rf *Raft) leaderElection(term, lastLogIndex, lastLogTerm int) {
 				return
 			}
 
-				rf.mu.Lock()
+			rf.mu.Lock()
 			// Double-Check if raft is still candidate
 			// Double-Check if currentTerm is the same as original term before sending RPC
 			// Double-Check lastLogIndex and lastLogIndex
@@ -419,15 +444,20 @@ func (rf *Raft) leaderElection(term, lastLogIndex, lastLogTerm int) {
 			}
 			// check if raft gets majority of vote
 			if votes.Load() <= 0 {
-					// transition to Leader
-					rf.status = SLEADER
-					// start timer goroutine in background to send leader's heartbeat
-					go rf.replicateLogs() // register replication task
-					rf.mu.Unlock()
-					canStop.Store(true) // stop election
-					return
+				// transition to Leader
+				rf.status = SLEADER
+				// reinitialize Leader's states of followers
+				for i := range rf.peers {
+					rf.NextIndex[i] = rf.le
+					rf.MatchIndex[i] = 0
 				}
+				// start timer goroutine in background to send leader's heartbeat
+				go rf.replicateLogs() // register replication task
 				rf.mu.Unlock()
+				canStop.Store(true) // stop election
+				return
+			}
+			rf.mu.Unlock()
 		}(peer)
 	}
 }
@@ -458,11 +488,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.NextIndex = make([]int, len(peers))
 	rf.MatchIndex = make([]int, len(peers))
 
-	rf.logs[0] = &LogEntry{Term: 0}
-
-	for i := range rf.NextIndex {
-		rf.NextIndex[i] = rf.le // better for failure recovery?
-	}
+	rf.logs[0] = &LogEntry{Term: 0} // dummy entry
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

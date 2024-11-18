@@ -30,7 +30,7 @@ func (rf *Raft) replicateLogs() {
 
 				go rf.syncLogOrHeartbeat(peer) // Don't wait, run background.otherwise maybe delay next heartbeat
 
-				time.Sleep(100 * time.Millisecond)
+				time.Sleep(50 * time.Millisecond)
 			}
 		}(i)
 	}
@@ -53,6 +53,18 @@ func (rf *Raft) replicateLogs() {
 // -   they still wait for ACK to commit these logs from leader.
 // - 8.Leader attaches this commit-ACK on next append-request RPC(include heartbeat) for saving net bandwith.
 // - 9.When Followers accept append-request, they will use commit-ACK attached in RPC to keep pace with Leader.
+//
+// The Advantage of Raft's Log Replication
+// -   Brute Forcing Log Replication(Data-Full-Sync): Leader sends all logs from 0 to all Followers,
+// - followers save mismatched logs in local this method and consumes more and more bandwith as logs grow.
+// -   Raft Leader sends its log array suffix: sending 1 log first -> if follower rejects -> sending 2 or more logs suffix
+// - sending suffix with more and more logs util follower accept(namely the suffix is lost part of follower's log array).
+// - this approach is based on how to judge fastly Longest Logs Prefix of two logs array by Log Matching Property:
+// - 		follower determines whether prefix of its logs is the same as the prefix of leader's by comparing
+// - 	if last log before the suffix in follower's logs is the same as leader's last log before the suffix,
+// -	if true follower accept the suffix.
+// -
+// - In most case, leader only sends logs newly increased in log queue to majority of peers, saving net i/o
 //
 // when Leader replicates logs into a Follower, it can't assume that the states it maintains for the follower
 // is completely right. state like: NextIndex[i], MatchIndex[i].
@@ -91,6 +103,13 @@ func (rf *Raft) syncLogOrHeartbeat(peer int) {
 
 	// request the Follower to replicate logs in local, if rejected by follower, retry with more older logs
 	for !rf.killed() && nextIdx >= 0 {
+		if t := len(appendLogs); t > 0 && appendLogs[t-1].Term != term {
+			// don't replicate/commit logs that belongs to Old Leader into followers.
+			// maybe cause the newly elected Leader contains not all committed logs (Leader Completeness Property)
+			// avoid that the same index in different log of different node commit different log entries
+			return
+		}
+
 		args := &AppendEntriesArgs{
 			Term:         term,
 			Entries:      appendLogs,
@@ -125,7 +144,30 @@ func (rf *Raft) syncLogOrHeartbeat(peer int) {
 			rf.mu.Unlock()
 			return
 		} else {
-			nextIdx--
+			// slower approach, growing suffix one by one
+			// nextIdx--
+
+			// faster approach than upper method, assume reply's args is valid
+			if reply.XLen <= args.PrevLogIndex {
+				nextIdx = reply.XLen
+			} else {
+				idx := -1 // min index of log with reply.XTerm
+				for i := nextIdx - 2; i >= 0; i-- {
+					if rf.logs[i].Term < reply.XTerm {
+						break
+					} else if rf.logs[i].Term == reply.XTerm {
+						idx = i
+						break
+					}
+				}
+
+				if idx == -1 {
+					nextIdx = reply.XIndex
+				} else {
+					nextIdx = idx + 1 // less than old nextIdx
+				}
+			}
+
 			if nextIdx > 0 {
 				appendLogs = rf.logs[nextIdx:logsLen]
 				prevLogTerm = rf.logs[nextIdx-1].Term
@@ -144,8 +186,32 @@ func compareLogs(l0, l1 *LogEntry) bool {
 }
 
 // the maintaining task of Leader's CommitIndex is split out of workflow of Log-Replication
+//   - find which log entries get majority of vote, namely replicated in majority of followers'log
 //
-// Leader can't determine whether logs with previous term are committed???
+// Log-Replication Restriction for Leader
+// for ensuring new elected Leader contains all committed log entries once it's being leader:
+//   - Leader can not replicate old log of old leader into followers
+//   - Leader can not commit old log of old leader
+//   - Leader can replicate and commit its own log ONLY!!!
+//
+// this restriction and the Leader Election Restriction is the guarantee of Leader Completeness Property
+//
+// How to determine if the log belongs to current Leader?
+//   - like determining whether a log is newer than other in Leader Election Restriction
+//     comparing last entry's term and index in log array
+//
+// example:
+//   - log[0,1,2] represents a log: length=3; contains 3 entries/commands;
+//     the number in it are the term of leaders that appended the entry into log.
+//   - this log belongs to the leader in the term 2, because the term of the last entry is 2
+//     it represents that this log was created during term 2 by the old leader.
+//     maybe a newer log[0,1,3] was committed, if current leader replicates and commits log[0,1,2]
+//     it could causes committed log entry with term 3 is overwrote by log entry with 2.
+//   - if current leader of term 6 append a entry into log, it becomes log[0,1,2,6]
+//     so this log belongs to current leader, it can be replicated and committed
+//   - new leaders can not 'immediately' conclude that it was committed if leader don't
+//     do some extra work that communicates with followers. In Raft, Leader doesn't do that work,
+//     upon a node becomes a leader, it can assume that it saved all log from old leader
 func (rf *Raft) commitLogs() {
 	for !rf.killed() {
 		rf.mu.Lock()
@@ -154,9 +220,11 @@ func (rf *Raft) commitLogs() {
 			return
 		}
 
+		// check if current log belongs to current leader by checking last log entry's term
 		if rf.logs[rf.le-1].Term != rf.currentTerm {
 			// Leader can not commit previous term's log
 			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 
@@ -173,12 +241,18 @@ func (rf *Raft) commitLogs() {
 		// get the max index that has major indexs larger than it
 		// update rf.CommitIndex if true
 		if t := sortArr[major-1]; t > rf.CommitIndex {
-			rf.CommitIndex = t
+			if rf.logs[t].Term == rf.currentTerm {
+				// Leader replicates and commits only its own log
+				rf.CommitIndex = t
+			} else {
+				// don't replicate/commit logs that belongs to Old Leader into followers.
+				// maybe cause the newly elected Leader contains not all committed logs (Leader Completeness Property)
+			}
 		}
 
 		rf.mu.Unlock()
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -196,6 +270,6 @@ func (rf *Raft) apply2StateMachine(applyCh chan ApplyMsg) {
 		}
 		rf.mu.Unlock()
 
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 }

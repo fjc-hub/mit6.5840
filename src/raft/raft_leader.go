@@ -10,7 +10,7 @@ import (
 // old crashed leader to replicate its logs to majority of followers.
 // 2.Second, leader has resposibility to send missing logs of follower's log queue,
 // even the follower lose its all logs, leader still need re-transmit all logs
-
+//
 // spawn log-sync goroutine for every other peer nodes
 func (rf *Raft) replicateLogs() {
 	for i := range rf.peers {
@@ -21,14 +21,31 @@ func (rf *Raft) replicateLogs() {
 		// replicate logs or send heartbeats, periodically
 		go func(peer int) {
 			for !rf.killed() {
-				rf.mu.Lock()
+				rf.lock()
 				if rf.killed() || rf.status != SLEADER {
-					rf.mu.Unlock()
+					rf.unlock()
 					return
 				}
-				rf.mu.Unlock()
+				rf.unlock()
 
-				go rf.syncLogOrHeartbeat(peer) // Don't wait, run background.otherwise maybe delay next heartbeat
+				/**Do not Log-Replication for each follower One After One in serializable form.
+				 * reason as below:
+				 *	 serializing Log Replication makes no sense, and slow throughput compared to concurrent.
+				 * RPC caller can't guarantee that callee will receive args in the order that caller sending,
+				 * because of unreliable network.
+				 *   for example: there are both Long-log AE and Short-log AE in the network at the same time,
+				 * although Long-log AE is sent after Short-log AE by leader, (but)follower may receives Long-
+				 * log AE first.
+				 *   in this case, follower may saves long-log first and then replace long log with short log
+				 * that arrived later. the replies of this 2 AE, will arrive Leader in any order also,if leader
+				 * using reply value of short-log AE after reply of long-log AE, it will count wrong agreement
+				 * vote for the discarded log entries by follower.
+				 *
+				 * For solving this, follower's AE handler does not delete log entries that follower can not
+				 * determine as inconsistent
+				 * P.S. AE = appendEntries RPC request
+				 */
+				go rf.syncLog(peer) // send log or heartbeat
 
 				time.Sleep(50 * time.Millisecond)
 			}
@@ -40,7 +57,7 @@ func (rf *Raft) replicateLogs() {
 }
 
 // Leader replication Task: replicates its logs into majority of Followers, not all nodes is required.
-// Workflow as below:
+// Workflow (In case of no Snapshot) as below:
 // - 1.Leader sends a follower a set of logs that it thinks the follower lost.
 // - 2.If the follower rejects to append/overwrite the logs, leader re-send append RPC with more logs to the follower.
 // - 3.If the follower accepts this logs, it appends/overwrites the logs down its local logs and replies leader with OK.
@@ -79,81 +96,118 @@ func (rf *Raft) replicateLogs() {
 // A slow raft follower's logs may Far Behind Leader's, because of "majority vote", leader doesn't care whether
 // the slow node saves logs received from leader when leader commits logs
 //
-// leader's CommitIndex may change during retring RPC, so peers may get old CommitIndex. this no matter, no one care
+// leader's CommitIndex may change during retring RPC, so peers may get old CommitIndex. it no matter, no one care
 // whether followers'log is committed, only replicating logs in their logs queue is enough for leader and clients
+// to which leader serves.
 //
-// Implicit Heartbeat: when no new uncommitted logs for the follower, this function will send a append operation
-// with no logs, this append operation is implicit heartbeat.
+// Implicit Heartbeat: AE has the effect of explicit heartbeat
 // Heartbeat's effect:
 //  1. suppress other servers trigger election
-//  2. periodically send leader's CommitIndex to notify followers that previous appended logs can be committed
-func (rf *Raft) syncLogOrHeartbeat(peer int) {
+//  2. attach leader's CommitIndex to followers to ACK Previous appended log entries
+//
+// "Log Matching Property" refers to section 5.3 of original paper
+func (rf *Raft) syncLog(peer int) {
+	rf.lock()
 
-	rf.mu.Lock()
+	// check if current leader can replicate this log into follower
+	if rf.NextIndex[peer] <= rf.lastEntryIndex() && rf.lastEntryTerm() != rf.currentTerm {
+		// it will breaks Leader Completeness Property if send log belongs to old leader
+		rf.unlock()
+		return
+	}
+
+	// Otherwise replicate leader log into follower or send heartbeat
+
 	var (
-		nextIdx      = rf.NextIndex[peer]       // need Double-Check after RPC
-		term         = rf.currentTerm           // need Double-Check after RPC
-		logsLen      = rf.le                    // need Double-Check after RPC
-		prevLogTerm  = rf.logs[nextIdx-1].Term  // need Double-Check after RPC
-		appendLogs   = rf.logs[nextIdx:logsLen] // need Double-Check after RPC,using logsLastTerm,appendLogs may change
-		logsLastTerm = rf.logs[rf.le-1].Term
-		commitIndex  = rf.CommitIndex
-	)
-	rf.mu.Unlock()
+		term = rf.currentTerm // need Double-Check after RPC
 
-	// request the Follower to replicate logs in local, if rejected by follower, retry with more older logs
-	for !rf.killed() && nextIdx >= 0 {
-		if t := len(appendLogs); t > 0 && appendLogs[t-1].Term != term {
-			// don't replicate/commit logs that belongs to Old Leader into followers.
-			// maybe cause the newly elected Leader contains not all committed logs (Leader Completeness Property)
-			// avoid that the same index in different log of different node commit different log entries
-			return
-		}
+		/**Index of the will-sending suffix log
+		 * Log[1:maxIdx-1]: the log that needs replicate into followers by leader
+		 * Log[x:maxIdx-1]:
+		 *		the log suffix that needs send to follower by leader in this loop,
+		 * 	could be empty, then will send a heartbeat.
+		 */
+		maxIdx = rf.lastEntryIndex() + 1
+
+		/**Offset in rf.logs array, not real index of log entry
+		 * no need double check whether sended log entries was changed, because:
+		 * 	 Double-checking current term after RPC represents that the leader did not malfunction,
+		 * plus Leader never updates/deletes/inserts entry into the prefix of its own log.
+		 * so sended log entris in leader's log are always the same as before.
+		 *   Leader only change log in two cases: Appending new entries into its log after position rf.le;
+		 * Compacting a prefix of applied logs into snapshot.
+		 *
+		 * rf.logs[start:end-1] represents a suffix of leader's log, sending the log suffix later.
+		 * sending an implicit heartbeat if start == end
+		 */
+		start = rf.offset(rf.NextIndex[peer])
+		end   = rf.le
+
+		commitIndex = rf.CommitIndex
+	)
+
+	// query missing log entries of follower's log within the rf.logs[start:end]
+	// if follower reply agreement, return
+	for start > 0 {
 
 		args := &AppendEntriesArgs{
 			Term:         term,
-			Entries:      appendLogs,
-			PrevLogTerm:  prevLogTerm,
-			PrevLogIndex: nextIdx - 1,
+			Entries:      rf.logs[start:end],
+			PrevLogTerm:  rf.prevEntryTerm(start),
+			PrevLogIndex: rf.prevEntryIndex(start),
 			LeaderCommit: commitIndex,
 		}
+
+		rf.unlock()
 
 		reply := AppendEntriesReply{}
 		if ok := rf.sendAppendEntries(peer, args, &reply); !ok {
 			return
 		}
 
-		rf.mu.Lock()
+		rf.lock()
 		// Double-Check if raft is still leader and alive
 		// Double-Check if currentTerm is the same as original term before sending RPC
-		// Double-Check whether current logs are still equal to original logs sub-queue by Log Matching Property
-		// 		Log Matching Property refers to section 5.3 of original paper
-		if rf.killed() || rf.status != SLEADER || rf.currentTerm != term || rf.NextIndex[peer] != nextIdx ||
-			rf.le < logsLen || rf.logs[nextIdx-1].Term != prevLogTerm ||
-			rf.logs[logsLen-1].Term != logsLastTerm {
-			// something changed, invalidate reply
-			rf.mu.Unlock()
+		// Double-Check if log[:maxIdx] have replicated by other goroutines (maybe next replication had run faster)
+		//
+		// Log's length maybe change after RPC, because snapshot can compact log
+		if rf.killed() || rf.status != SLEADER || rf.currentTerm != term {
+			// something changed, invalidate this reply
+			rf.unlock()
+			return
+		}
+
+		// check if detected higher term
+		if reply.Term > term {
+			rf.recvNewTerm(reply.Term)
+			rf.unlock()
 			return
 		}
 
 		// check if the append/overwrite operation is accepted by follower
 		if reply.Success {
-			// replicate logs into peer node successfully
-			rf.MatchIndex[peer] = logsLen - 1
-			rf.NextIndex[peer] = logsLen
-			rf.mu.Unlock()
+			// replicate Log[1:maxIdx-1] into peer node successfully
+			rf.MatchIndex[peer] = maxIdx - 1
+			rf.NextIndex[peer] = maxIdx
+			rf.unlock()
 			return
 		} else {
-			// slower approach, growing suffix one by one
-			// nextIdx--
-
-			// faster approach than upper method, assume reply's args is valid
+			/**
+			 * Grow the suffix on leader's log for next sending. if follower accepts it,
+			 * represents that the suffix from leader's log and the prefix from follower's
+			 * can constitute a log identical to leader's log.
+			 *
+			 * slower approach: growing suffix one by one
+			 * faster approach: roll back the pointer start more at a time
+			 */
 			if reply.XLen <= args.PrevLogIndex {
-				nextIdx = reply.XLen
+				// follower's log is too short
+				start = rf.offset(reply.XLen)
 			} else {
-				idx := -1 // min index of log with reply.XTerm
-				for i := nextIdx - 2; i >= 0; i-- {
-					if rf.logs[i].Term < reply.XTerm {
+				idx := -1
+				// search for log entry with term=reply.XTerm
+				for i := end - 1; i > 0; i-- {
+					if rf.logs[i].Term < reply.XTerm { // no more, fast quit
 						break
 					} else if rf.logs[i].Term == reply.XTerm {
 						idx = i
@@ -162,27 +216,28 @@ func (rf *Raft) syncLogOrHeartbeat(peer int) {
 				}
 
 				if idx == -1 {
-					nextIdx = reply.XIndex
+					start = rf.offset(reply.XIndex)
 				} else {
-					nextIdx = idx + 1 // less than old nextIdx
+					start = idx + 1
 				}
 			}
 
-			if nextIdx > 0 {
-				appendLogs = rf.logs[nextIdx:logsLen]
-				prevLogTerm = rf.logs[nextIdx-1].Term
-				rf.NextIndex[peer] = nextIdx
+			if start > 0 {
+				// speed up subsequent AppendEntries in this term
+				// if not, may fail tests due to the long time spent
+				rf.NextIndex[peer] = rf.index(start)
 			}
 		}
-		rf.mu.Unlock()
 	}
-}
 
-// compare two logs sub-queue is equal by Log Matching Property
-func compareLogs(l0, l1 *LogEntry) bool {
-	// assume log l0's index is equal to l1's
-	// so if they have the same term, they are the same log and logs before they are all equal
-	return l0.Term == l1.Term
+	rf.unlock()
+
+	// check whether follower loses/lacks part of log entries that were compacted by leader
+	if start <= 0 {
+		// send snapshot if follower's log lags behind leader too much
+		rf.sendSnapshot(peer)
+		return
+	}
 }
 
 // the maintaining task of Leader's CommitIndex is split out of workflow of Log-Replication
@@ -214,16 +269,16 @@ func compareLogs(l0, l1 *LogEntry) bool {
 //     upon a node becomes a leader, it can assume that it saved all log from old leader
 func (rf *Raft) commitLogs() {
 	for !rf.killed() {
-		rf.mu.Lock()
+		rf.lock()
 		if rf.status != SLEADER {
-			rf.mu.Unlock()
+			rf.unlock()
 			return
 		}
 
 		// check if current log belongs to current leader by checking last log entry's term
-		if rf.logs[rf.le-1].Term != rf.currentTerm {
+		if rf.lastEntryTerm() != rf.currentTerm {
 			// Leader can not commit previous term's log
-			rf.mu.Unlock()
+			rf.unlock()
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
@@ -241,35 +296,79 @@ func (rf *Raft) commitLogs() {
 		// get the max index that has major indexs larger than it
 		// update rf.CommitIndex if true
 		if t := sortArr[major-1]; t > rf.CommitIndex {
-			if rf.logs[t].Term == rf.currentTerm {
+			if rf.logs[rf.offset(t)].Term == rf.currentTerm {
 				// Leader replicates and commits only its own log
 				rf.CommitIndex = t
+				// apply committed log entries if rf.CommitIndex changed
+				if rf.LastApplied < rf.CommitIndex {
+					rf.applyCond.Broadcast() // wakeup
+				}
 			} else {
 				// don't replicate/commit logs that belongs to Old Leader into followers.
 				// maybe cause the newly elected Leader contains not all committed logs (Leader Completeness Property)
 			}
 		}
 
-		rf.mu.Unlock()
+		rf.unlock()
 
 		time.Sleep(10 * time.Millisecond)
 	}
 }
 
-// throw newly committed logs up to upper layer application(namely state machine)
-func (rf *Raft) apply2StateMachine(applyCh chan ApplyMsg) {
+// throw newly applied log entries up to upper layer application(namely state machine) by a go channel
+// notice: go channel may blocks, don not hold lock to do time-spent operation
+func (rf *Raft) send2StateMachine(applyCh chan ApplyMsg) {
 	for !rf.killed() {
-		rf.mu.Lock()
-		for ; rf.LastApplied+1 <= rf.CommitIndex; rf.LastApplied++ {
-			msg := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.logs[rf.LastApplied+1].Command,
-				CommandIndex: rf.LastApplied + 1,
-			}
-			applyCh <- msg
-		}
-		rf.mu.Unlock()
 
-		time.Sleep(10 * time.Millisecond)
+		if arr := rf.mq.pop(); len(arr) > 0 {
+			for i := range arr {
+				applyCh <- *(arr[i])
+			}
+		} else {
+			rf.mq.wait() // wait new event
+		}
+
+		// time.Sleep(10*time.Millisecond) // busy wait not elegant
 	}
+}
+
+func (rf *Raft) sendSnapshot(peer int) {
+
+	rf.lock()
+	var (
+		term = rf.currentTerm // need Double-Check after RPC
+		args = &InstallSnapshotArgs{
+			Term:              term,
+			LastIncludedTerm:  rf.snapshotTerm,
+			LastIncludedIndex: rf.snapshotIndex,
+			Snapshot:          rf.snapshot,
+		}
+	)
+	rf.unlock()
+
+	reply := InstallSnapshotReply{}
+	if ok := rf.sendInstallSnapshot(peer, args, &reply); !ok {
+		return
+	}
+
+	rf.lock()
+	defer rf.unlock()
+
+	// check if higher term
+	if reply.Term > rf.currentTerm {
+		rf.recvNewTerm(reply.Term)
+	}
+
+	// Double-Check after RPC
+	if rf.status != SLEADER || term != rf.currentTerm {
+		return
+	}
+	// check reply's result
+	if reply.Success {
+		// update leader's states about the follower if need
+		rf.NextIndex[peer] = args.LastIncludedIndex + 1
+		rf.MatchIndex[peer] = args.LastIncludedIndex
+	}
+
+	// if fail, will try next time
 }

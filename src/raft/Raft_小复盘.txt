@@ -16,7 +16,7 @@
 
         旧Leader“日志备份”操作需要获得过半raft节点同意后才能完成，那么必然有过半的raft节点保存了它的‘所有’日志，
         后续同意新Leader当选的过半节点中，也至少一个备份了旧leader的日志（即包含了旧Leader的‘所有’日志）
-        两个过半集合中至少有一个重叠的节点
+        两个过半集合中至少有一个重叠的节点（可以作为新旧Leader之间的桥梁，新leader可以从这个桥梁上面获取旧Leader的信息）
 
         Raft协议通过在Leader选举过程和日志备份过程增加限制，确保新leader只会是包含了旧leader所有日志的节点（参考22.Leader Completeness Property）
         其他共识算法可能允许任意节点当选，但新Leader需要与过半投票节点通信，从中找到包含旧leader所有日志的节点
@@ -133,7 +133,7 @@
     同一个raft节点可能后台有多个不同term的选举goroutine，每次RPC收到答复后都要Double-Check当前状态和RPC前的状态，
     以决定答复是否有效
 
-*10.使用Go中WaitGroup的弊端
+*10.使用Go中WaitGroup的遇到的问题
     Wait操作必须等待内部计数器归零才能返回。在代码里使用了它来实现并发地发送RPC，在最坏的情况下wait的goroutine
     需要等待一半的raft服务器超时才能返回，如果上层函数依赖这个返回才进行后续代码，比如可能会delay下一轮心跳，导致出现Leader未故障
     但仍发生新的、更高term任期号的选举。Leader没有压制住其他节点发起选举。
@@ -194,7 +194,7 @@
      从某一个位置开始比较好，由leader为每个follower都维护一个位置，后续同步从这个位置向前查找第一条不同日志的index，对于一个稳定且
      leader发生故障不多的系统是一个好方案（显然 leader发生故障后这个信息就丢失了，新leader需要从第一条或最后一条重新摸索）
      
-15.leader发起的appendLogs操作获得多数投票后leader会在执行本地commit，但投票赞成的follower只是把这一批log赞存在自己log队列中还没有提交，
+15.leader发起的appendLogs操作获得多数投票后leader会在本地执行commit，但投票赞成的follower只是把这一批log赞存在自己log队列中还没有提交，
    follower们等着leader提交后发送提交信号-ACK确认后才能提交。leader一般是把可提交RPC-ACK捆绑到“下一次”appendLogs请求中（ACK合并）
    leader可以把ACK合并到心跳中吗？
       可以，appendLogs和heartbeat请求唯一的区别是heartbeat中的不包含log，其他参数依旧传了，对同一个follower的日志备份和心跳操作
@@ -231,10 +231,33 @@
         有一个subtle的点是：“he leader that created the entry”，创建/收到这条日志的Leader
 
 
-19.不需要等待RPC的场景有那些？
-    1.每一轮选举不要等，可能有一些响应特别慢的RPC大大增加了这一轮的耗时，从而影响下一个term选举的开始。
-    2.针对每个peer的每一轮日志备份（Logs Replication），即追加日志操作不要等，原因同上。
-    这些场景都可以开启一个后台goroutine来做，只需要注意在goroutine中增加Double-Check及时退出协程即可
+*19.哪些需要RPC的任务可以异步执行？即下一次执行不需要等待上一次执行结束
+    异步执行特点：无需等待同步。如果本次操作的耗时太长会延迟下一次操作执行，下一次操作不依赖前一次操作是否完成，
+                 但会使这些操作重新排序 （乱序执行）。
+    同步执行特点：能保证操作之间有序，串行执行。
+
+    在RPC场景下，即使串行发送RPC请求，经过网络后，永远也无法保证接收方一定按发送顺序接收消息。
+    也不能保证发送方按它发送请求的顺序收到响应。（使用网络 == 享受极致的乱序吧）
+
+    1.每一轮选举：
+        如果等待上一轮选举结束，可以由于少数节点故障或者网络延迟导致本轮选举中有少数节点没有答复，即出现“少数节点的问题导致整体无法继续”的情况
+        所以，如果选举计时器超时了，即使还处于candidate状态，也开启这一轮新的选举，将上一次结果作废
+    
+    2.针对每个peer的每一轮日志备份（即追加日志操作 Logs Replication）：
+       *无论Caller是否按顺序发送RPC，永远也无法保证Callee能按发送顺序接收到RPC，也永远无法保证按发送顺序收到响应。
+        比如Caller发送一个带log的AE，重试了几次还是超时了，这一轮执行完毕；到下一轮，发送一个log更长的AE
+        注意此时网络中可能有两个log长度不同的AE请求，即上一次发送的AE仍然滞留在网络中，
+        而且可能后发出的长log的AE先到达follower，先发出的短log的AE后到达，
+        如果follower采用覆盖策略，它假设后收到的log更新，则会导致follower自己只保存了更短的log，
+        极端情况下
+            有可能是短log的回复先于长log的回复到达leader，leader最终以为follower备份了长log，
+            以为follower接受agree长log中的所有entry，从而提交这些entry，出大问题
+        
+        这里采取的方案是：允许Leader并发地乱序发送AE，防止被长耗时/超时的AE阻塞，极大地提高效率；
+        follower在AE处理函数中增加逻辑：在判断两个log前缀一致的情况下，比较AE中的每个log entry，
+        ①如果出现不一致（同index，不同term）entry，则说明follower log中次entry后续的entry都“可能”
+        与Leader log中的entry不一致，全部丢弃；并把AE中的log entry全部append到对应位置。
+        ②如果未出现不一致的entry，则无需操作
 
 
 *20.为什么不需要持久化raft节点维护的commitIndex、lastApplied，经历crash-reboot后会不会由于没持久化lastApplied造成已提交的日志重复执行？
@@ -278,7 +301,39 @@
         会使得已提交日志的部分条目被覆盖
             
 
-    以s4为例，如果term为5时
+23.引入snapshot快照机制压缩日志（Log Compaction）后，Leader备份日志（Log Replication）的任务有什么变化？
+    快照机制说明：snapshot机制会时不时去除日志数组中一个已经提交并应用到上层状态机的前缀，将其以状态机快照的形式保存
+        RPC调用前后日志长度可能发生变化，对于logs长度的Double-Check可以放宽
+        （代码之前的版本这么做其实也没必要，冗余了，因为确保了RPC前后都是同一个Leader，而leader在自己的任期内只会append自己的log，除了snapshot不会删改）
 
+
+24.Leader提交完日志后会把ACK合并到下一次心跳发给全部节点，落后leader的follower怎么处理这个信息？
+    根据heartbeat中“上一个entry”的信息（prevLogIndex，prevLogTerm）判断自身log的前缀是否和leader的log相同
+    如果这一段前缀是一样的，那么再根据请求中leader的commitIndex（即ACK）判断前缀中哪些条目可以commit。
+
+
+25.raft层和应用层如何通信？
+    raft层把需要应用层执行的指令发送到Golang Channel，应用层从这个固定长度的阻塞队列中读指令并执行
+    应用层只有在创建Snapshot快照时才会调用raft层的snapshot()函数要求raft层压缩log
+
+
+26.向与上层应用通信的消息队列（golang channel）投递消息时需要注意什么？
+    首先，消息分为两种：log entry 和 snapshot
+      1.必须要特别注意消息产生的顺序和消息存入队列的顺序，防止上层应用读到错误顺序的消息，旧状态覆盖新状态
+    所有这里不要异步投递每个消息，怕乱序。
+    【顺序：新snapshot在旧snapshot之后、未压缩的log-entry在snapshot之后】
+
+      2.必须要特别注意这个消息队列可能阻塞的情况，在当前goroutine持有lock的情况下最好不要投递消息，
+    因为上层app有可能调用raft层snapshot快照函数，尝试获取锁，极有可能deadlock。
+    【循环依赖关系：raft.lock() -> mq.push() -> app.snapshot() -> raft.lock()】
+
+    可以设计一个可自动扩容的非阻塞队列，用于按顺序存储这两种消息，然后后台按顺序读取非阻塞队列并投递
+
+
+27.如何理解raft协议的“Strong Leadership”特点？
+    1.raft协议保证了只有日志中包含旧Leader全部已提交日志条目的节点能当选Leader节点，即“Leader Completeness Property”
+    2.每个任期只允许存在一个leader
+    3.只有Leader能处理/应答客户端请求
+    4.log数据只会从Leader流向Follower,所有节点上的log都需要与leader节点的同步
 
 https://raft.github.io/

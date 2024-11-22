@@ -10,7 +10,7 @@ import (
 )
 
 // Debugging
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) {
 	if Debug {
@@ -20,7 +20,7 @@ func DPrintf(format string, a ...interface{}) {
 
 // randomized election timeout
 func randTimestamp() int64 {
-	return time.Now().UnixMilli() + 200 + (rand.Int63() % 300)
+	return time.Now().UnixMilli() + 200 + (rand.Int63() % 200)
 }
 
 func copyIntSlice(src []int, exceptIdx int) (ret []int) {
@@ -43,6 +43,13 @@ func min(x, y int) int {
 	return x
 }
 
+func max(x, y int) int {
+	if x < y {
+		return y
+	}
+	return x
+}
+
 // only for Debug
 func obj2json(obj interface{}) string {
 	s, e := json.Marshal(obj)
@@ -59,13 +66,20 @@ for i := range cfg.rafts {
 }
 */
 func raft2string(rf *Raft) string {
-	return fmt.Sprintf("raft(%v;%v;%v) Logs=%v (%v,%v); %v %v",
+	return fmt.Sprintf("raft(%v;%v;%v) Logs=%v (%v,%v); %v %v (%v %v)",
 		rf.me, rf.currentTerm, rf.status,
 		serializeLogs(rf.logs),
-		rf.CommitIndex, rf.LastApplied,
-		rf.NextIndex, rf.MatchIndex)
+		rf.LastApplied, rf.CommitIndex,
+		rf.NextIndex, rf.MatchIndex,
+		rf.snapshotTerm, rf.snapshotIndex)
 }
 
+// only for Debug
+func insArgs(args *InstallSnapshotArgs) string {
+	return fmt.Sprintf("%v,%v,%v", args.Term, args.LastIncludedTerm, args.LastIncludedIndex)
+}
+
+// only for Debug
 func serializeLogs(logs []*LogEntry) string {
 	var b strings.Builder
 	for i := range logs {
@@ -76,4 +90,12 @@ func serializeLogs(logs []*LogEntry) string {
 		}
 	}
 	return fmt.Sprintf("[%s]", b.String())
+}
+
+// only for Debug
+func mtimer(s string) func() {
+	t := time.Now()
+	return func() {
+		DPrintf("%s consume %vms\n", s, time.Now().Sub(t).Milliseconds())
+	}
 }

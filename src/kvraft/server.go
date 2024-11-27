@@ -1,53 +1,131 @@
 package kvraft
 
 import (
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
+const TIMEOUT_PERIOD = 200 // millisecond
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Typ       OpType
+	Key       string
+	Value     string
+	ClientKey string
+	RequestId int64
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
-	dead    int32 // set by Kill()
+	mu   sync.Mutex
+	me   int
+	rf   *raft.Raft
+	dead int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	pending map[string]chan string
+
+	/* state machine */
+	sm *stateMachine
 }
 
+// k/v state machine
+type stateMachine struct {
+	// mutex         sync.Mutex // no concurrency on cache and idempotentMap
+	cache         map[string]string     // state for storing key-value pairs
+	idempotentMap map[string]clerkstate // state for detecting consecutive duplicated requests
+}
+
+// clerk's state saved in kv server
+type clerkstate struct {
+	/* lastReqId represents last request's id from the clerk
+	 * using to guarantee limited Idenpotence in the case that clerk sends request one by one
+	 * consecutive duplicated request will be idempotent
+	 */
+	lastReqId int64
+	result    string
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	op := Op{
+		Typ:       OP_GET,
+		Key:       args.Key,
+		ClientKey: args.ClientKey,
+		RequestId: args.RequestId,
+	}
+	// send log entry to raft
+	isLeader, done, cancel := kv.addLogEntry(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// wait for getting majority agreement
+	select {
+	case ret := <-done:
+		reply.Err = OK
+		reply.Value = ret
+	case <-time.After(TIMEOUT_PERIOD * time.Millisecond): // timeout
+		cancel()
+		reply.Err = ErrTimeout
+	}
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{
+		Typ:       OP_PUT,
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientKey: args.ClientKey,
+		RequestId: args.RequestId,
+	}
+
+	// send log entry to raft
+	isLeader, done, cancel := kv.addLogEntry(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// wait for getting majority agreement
+	select {
+	case <-done:
+		reply.Err = OK
+	case <-time.After(TIMEOUT_PERIOD * time.Millisecond): // timeout
+		cancel()
+		reply.Err = ErrTimeout
+	}
 }
 
 func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	op := Op{
+		Typ:       OP_APPEND,
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientKey: args.ClientKey,
+		RequestId: args.RequestId,
+	}
+	// send log entry to raft
+	isLeader, done, cancel := kv.addLogEntry(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	// wait for getting majority agreement
+	select {
+	case <-done:
+		reply.Err = OK
+	case <-time.After(TIMEOUT_PERIOD * time.Millisecond): // timeout
+		cancel()
+		reply.Err = ErrTimeout
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -61,12 +139,133 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+// Mux:
+// add all kinds of commands into Multiplexer(raft log + kv.pending)
+func (kv *KVServer) addLogEntry(op Op) (isLeader bool, done chan string, cancel func()) {
+
+	/* Must lock "rf.Start()" and "kv.pending[tag]=done" in the same critical regeion
+	 * to guarantee atomicity of this two operations!!!
+	 * If not, Dmux will dispatch results after "rf.Start()", then will see partial
+	 * state about Mux queue
+	 *
+	 * be careful about deadlock, because of acquiring 2 locks
+	 */
+	kv.mu.Lock()
+	// send op request as log entry into raft
+	_, _, isLeader = kv.rf.Start(op)
+	if !isLeader {
+		kv.mu.Unlock()
+		return
+	}
+
+	// kv.mu.Lock()
+	// update Dmux/Dispatch rules
+	done = make(chan string, 1)
+	tag := muxIdentifier(op.ClientKey, op.RequestId)
+	kv.pending[tag] = done
+
+	kv.mu.Unlock()
+
+	cancel = func() {
+		/* remove the reference to the done channel
+		 * let it can be recycling by GC
+		 */
+		kv.mu.Lock()
+		kv.pending[tag] = nil
+		kv.mu.Unlock()
+	}
+
+	return
+}
+
+// D-Mux:
+// - 1.dispatch results from raft layer to RPC handler by looping applyCh(MQ)
+// - 2.execute commands in log entries had committed by raft
+// - 3.if no RPC handler waits for the output, then only execute but not dispatch
+func (kv *KVServer) consumeTicker(applyCh chan raft.ApplyMsg) {
+	for !kv.killed() {
+
+		for msg := range applyCh {
+			if msg.CommandValid {
+				// acquire command
+				op, ok := msg.Command.(Op)
+				if !ok {
+					panic("unknown type of Command ApplyMsg")
+				}
+				// execute command
+				ret := kv.sm.exeCmd(op)
+				// dispatch result
+				kv.dispatch(op, ret)
+
+			} else if msg.SnapshotValid {
+
+			} else {
+				panic("unknown type of ApplyMsg")
+			}
+		}
+	}
+}
+
+func (kv *KVServer) dispatch(op Op, out string) {
+	tag := muxIdentifier(op.ClientKey, op.RequestId)
+
+	kv.mu.Lock()
+	done := kv.pending[tag]
+	delete(kv.pending, tag)
+	kv.mu.Unlock()
+
+	if done == nil {
+		/* 1.rpc handler cancel waiting this output event
+		 * 2.current kvserver not leader, not serve for clerk
+		 */
+		return
+	}
+
+	done <- out // send result into buffered channel instead of non-buffer channel
+}
+
+// send the command op to state machine to execute.
+// consecutive duplicated OP_GET command: subsequent req will be returned prevoius result,
+// but other type commands will be discarded
+func (sm *stateMachine) exeCmd(op Op) (ret string) {
+
+	// limited idempotent checking
+	// detecting consecutive duplicated request, but discontinuous, can't
+	cs := sm.idempotentMap[op.ClientKey]
+	if cs.lastReqId == op.RequestId {
+		if op.Typ == OP_GET {
+			ret = cs.result
+			return
+		} else {
+			return // consecutive duplicate request
+		}
+	}
+
+	// run command
+	switch op.Typ {
+	case OP_GET:
+		ret = sm.cache[op.Key]
+	case OP_PUT:
+		sm.cache[op.Key] = op.Value
+	case OP_APPEND:
+		sm.cache[op.Key] += op.Value
+	default:
+		panic("unknown command type")
+	}
+
+	// maintain state of clerk
+	sm.idempotentMap[op.ClientKey] = clerkstate{
+		lastReqId: op.RequestId,
+		result:    ret,
+	}
+	return
 }
 
 // servers[] contains the ports of the set of
@@ -90,12 +289,24 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
+	applyCh := make(chan raft.ApplyMsg)
+	kv.rf = raft.Make(servers, me, persister, applyCh)
 
-	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.pending = make(map[string]chan string)
 
-	// You may need initialization code here.
+	// create state machine
+	kv.sm = &stateMachine{
+		cache:         make(map[string]string),
+		idempotentMap: make(map[string]clerkstate),
+	}
+
+	// comsume message queue applyCh
+	go kv.consumeTicker(applyCh)
 
 	return kv
+}
+
+// get muxing identifier, using to Mux/Dmux
+func muxIdentifier(clerkId string, reqId int64) string {
+	return fmt.Sprintf("%s:%v", clerkId, reqId)
 }

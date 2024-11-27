@@ -20,13 +20,7 @@ func (rf *Raft) replicateLogs() {
 		// construct single goroutine for every single peer node
 		// replicate logs or send heartbeats, periodically
 		go func(peer int) {
-			for !rf.killed() {
-				rf.lock()
-				if rf.killed() || rf.status != SLEADER {
-					rf.unlock()
-					return
-				}
-				rf.unlock()
+			for {
 
 				/**Do not Log-Replication for each follower One After One in serializable form.
 				 * reason as below:
@@ -45,6 +39,32 @@ func (rf *Raft) replicateLogs() {
 				 * determine as inconsistent
 				 * P.S. AE = appendEntries RPC request
 				 */
+				rf.appendCond.L.Lock()
+				if rf.killed() || rf.status != SLEADER {
+					rf.appendCond.L.Unlock()
+					return
+				}
+				for rf.NextIndex[peer] > rf.lastEntryIndex() {
+					rf.appendCond.Wait()
+				}
+				rf.appendCond.L.Unlock()
+
+				go rf.syncLog(peer) // send log or heartbeat
+
+				time.Sleep(10 * time.Millisecond)
+			}
+		}(i)
+
+		// heartbeat periodically
+		go func(peer int) {
+			for {
+				rf.lock()
+				if rf.killed() || rf.status != SLEADER {
+					rf.unlock()
+					return
+				}
+				rf.unlock()
+
 				go rf.syncLog(peer) // send log or heartbeat
 
 				time.Sleep(50 * time.Millisecond)
@@ -141,21 +161,23 @@ func (rf *Raft) syncLog(peer int) {
 		 * sending an implicit heartbeat if start == end
 		 */
 		start = rf.offset(rf.NextIndex[peer])
-		end   = rf.le
-
-		commitIndex = rf.CommitIndex
+		// end   = rf.le // may changed during RPC, don't depend on its current value
 	)
 
 	// query missing log entries of follower's log within the rf.logs[start:end]
 	// if follower reply agreement, return
 	for start > 0 {
 
+		maxIdx = rf.lastEntryIndex() + 1 // must update it every loop
+		entries := make([]LogEntry, rf.le-start)
+		// Deep Copy
+		copy(entries, rf.logs[start:rf.le]) // Deep Copy
 		args := &AppendEntriesArgs{
 			Term:         term,
-			Entries:      rf.logs[start:end],
+			Entries:      entries,
 			PrevLogTerm:  rf.prevEntryTerm(start),
 			PrevLogIndex: rf.prevEntryIndex(start),
-			LeaderCommit: commitIndex,
+			LeaderCommit: rf.CommitIndex,
 		}
 
 		rf.unlock()
@@ -206,7 +228,7 @@ func (rf *Raft) syncLog(peer int) {
 			} else {
 				idx := -1
 				// search for log entry with term=reply.XTerm
-				for i := end - 1; i > 0; i-- {
+				for i := rf.le - 1; i > 0; i-- {
 					if rf.logs[i].Term < reply.XTerm { // no more, fast quit
 						break
 					} else if rf.logs[i].Term == reply.XTerm {

@@ -84,12 +84,13 @@ type Raft struct {
 		1.committed logs represent itself has replicated on majority of raft servers
 		2.log entry 0 is a dummy-element, don't contains it while creating snapshot
 	*/
-	logs        []*LogEntry
-	le          int // length of logs, init 1
-	CommitIndex int // index of highest log entry known to be committed
-	LastApplied int // index of highest log entry known to be applied/installed
+	logs        []LogEntry // using []*LogEntry will send error log when underlying LogEntry structure change
+	le          int        // length of logs, init 1
+	CommitIndex int        // index of highest log entry known to be committed
+	LastApplied int        // index of highest log entry known to be applied/installed
 
-	applyCond *sync.Cond // bind to the apply log entries event
+	appendCond *sync.Cond // bind to the event that leader got new command from upper clients
+	applyCond  *sync.Cond // bind to the apply log entries event
 
 	// leader special state
 	NextIndex  []int // leader considers that node[i] lost(may not lose) logs[NextIndex[i], le]
@@ -143,7 +144,7 @@ func (rf *Raft) readPersist(data []byte, snapshot []byte) {
 		// recover raft states
 		r := bytes.NewBuffer(data)
 		d := labgob.NewDecoder(r)
-		var logs []*LogEntry
+		var logs []LogEntry
 		var currentTerm int
 		var votedFor int
 		var snapshotTerm int
@@ -190,7 +191,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.unlock()
 
 	defer func() {
-		DPrintf("%v End Snapshot index(%v) %v\n", rf.me, index, raft2string(rf))
+		DPrintf("%v End Snapshot index(%v) %v\n", rf.me, index, Raft2string(rf))
 	}()
 
 	if rf.LastApplied < index || rf.snapshotIndex > index {
@@ -269,9 +270,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // AppendEntries RPC arguments structure.
 type AppendEntriesArgs struct {
 	Term         int
-	Entries      []*LogEntry // logs if can be appended
-	PrevLogTerm  int         // term of the log preceding Entries[0] in caller's logs queue
-	PrevLogIndex int         // index of the log preceding Entries[0] in caller's logs queue
+	Entries      []LogEntry // logs if can be appended
+	PrevLogTerm  int        // term of the log preceding Entries[0] in caller's logs queue
+	PrevLogIndex int        // index of the log preceding Entries[0] in caller's logs queue
 
 	// Leader’s commitIndex.
 	// used to tell follower commit all logs before it. attached ACK in subsequent request like TCP second handshake
@@ -361,7 +362,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			 * |-|--------|-----------------------------|--------| 	       Follower's
 			 * |-|--------|-------------------------|	       	           Follower's
 			 */
-			tail := []*LogEntry{}
+			tail := []LogEntry{}
 			if t := off + len(args.Entries) + 1; t < len(rf.logs) {
 				tail = rf.logs[t:]
 			}
@@ -541,10 +542,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, term, isLeader
 	}
 
-	rf.logs = append(rf.logs, &LogEntry{Term: term, Command: command})
+	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
 	index := rf.realLogLen()
 	rf.le = len(rf.logs)
 	rf.persist()
+
+	rf.appendCond.Broadcast() // notify background goroutine that the event appeared
 
 	return index, term, isLeader
 }
@@ -729,15 +732,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.status = SFOLLOWER
 	rf.expiredTime = time.Now().UnixMilli() + rand.Int63n(500)
-	rf.logs = make([]*LogEntry, 1)
+	rf.logs = make([]LogEntry, 1)
 	rf.NextIndex = make([]int, len(peers))
 	rf.MatchIndex = make([]int, len(peers))
 
-	rf.logs[0] = &LogEntry{Term: 0} // dummy entry
+	rf.logs[0] = LogEntry{Term: 0} // dummy entry
 	rf.le = 1
 
 	rf.mq = createMq()
 
+	rf.appendCond = sync.NewCond(&rf.mu)
 	rf.applyCond = sync.NewCond(&rf.mu)
 
 	// start ticker goroutine to start elections

@@ -336,4 +336,9 @@
     3.只有Leader能处理/应答客户端请求
     4.log数据只会从Leader流向Follower,所有节点上的log都需要与leader节点的同步
 
+
+28.注意：leader发送rf.Logs切片Slice中的日志条目时需要Deep copy
+    因为构造args参数到发送RPC这一小段时间内 释放了锁，所有rf.Logs切片底层引用的数组里面的值可能被其他任务修改（比如日志压缩）
+    如果不Deep Copy 很可能发出错数据
+
 https://raft.github.io/

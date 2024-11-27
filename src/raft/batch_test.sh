@@ -22,6 +22,8 @@ for i in {1..50}; do
     go test -run 3C >> ./results/result3C.txt;
 done  &
 
+echo $!
+
 # Lab3D
 for i in {1..50}; do 
     go test -run 3D >> ./results/result3D.txt;

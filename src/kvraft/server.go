@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -37,19 +38,21 @@ type KVServer struct {
 
 // k/v state machine
 type stateMachine struct {
-	// mutex         sync.Mutex // no concurrency on cache and idempotentMap
+	mutex         sync.Mutex
 	cache         map[string]string     // state for storing key-value pairs
-	idempotentMap map[string]clerkstate // state for detecting consecutive duplicated requests
+	idempotentMap map[string]Clerkstate // state for detecting consecutive duplicated requests
+
+	commitIdx int // index of last committed log entry
 }
 
 // clerk's state saved in kv server
-type clerkstate struct {
-	/* lastReqId represents last request's id from the clerk
+type Clerkstate struct {
+	/* LastReqId represents last request's id from the clerk
 	 * using to guarantee limited Idenpotence in the case that clerk sends request one by one
 	 * consecutive duplicated request will be idempotent
 	 */
-	lastReqId int64
-	result    string
+	LastReqId int64
+	Result    string
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -185,6 +188,19 @@ func (kv *KVServer) addLogEntry(op Op) (isLeader bool, done chan string, cancel 
 	return
 }
 
+func (kv *KVServer) snapshotTicker(persister *raft.Persister, maxraftstate int) {
+	for !kv.killed() {
+		if 0 < maxraftstate && maxraftstate <= persister.RaftStateSize() {
+			index, snap := kv.sm.snapshot()
+			if index > 0 {
+				kv.rf.Snapshot(index, snap)
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // D-Mux:
 // - 1.dispatch results from raft layer to RPC handler by looping applyCh(MQ)
 // - 2.execute commands in log entries had committed by raft
@@ -200,12 +216,13 @@ func (kv *KVServer) consumeTicker(applyCh chan raft.ApplyMsg) {
 					panic("unknown type of Command ApplyMsg")
 				}
 				// execute command
-				ret := kv.sm.exeCmd(op)
+				ret := kv.sm.exeCmd(op, msg.CommandIndex)
 				// dispatch result
 				kv.dispatch(op, ret)
 
 			} else if msg.SnapshotValid {
-
+				// restore  state machine by snapshot
+				kv.sm.applySnap(msg.Snapshot)
 			} else {
 				panic("unknown type of ApplyMsg")
 			}
@@ -234,14 +251,19 @@ func (kv *KVServer) dispatch(op Op, out string) {
 // send the command op to state machine to execute.
 // consecutive duplicated OP_GET command: subsequent req will be returned prevoius result,
 // but other type commands will be discarded
-func (sm *stateMachine) exeCmd(op Op) (ret string) {
+func (sm *stateMachine) exeCmd(op Op, index int) (ret string) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	// update last committed log entry's index
+	sm.commitIdx = index
 
 	// limited idempotent checking
 	// detecting consecutive duplicated request, but discontinuous, can't
 	cs := sm.idempotentMap[op.ClientKey]
-	if cs.lastReqId == op.RequestId {
+	if cs.LastReqId == op.RequestId {
 		if op.Typ == OP_GET {
-			ret = cs.result
+			ret = cs.Result
 			return
 		} else {
 			return // consecutive duplicate request
@@ -261,11 +283,51 @@ func (sm *stateMachine) exeCmd(op Op) (ret string) {
 	}
 
 	// maintain state of clerk
-	sm.idempotentMap[op.ClientKey] = clerkstate{
-		lastReqId: op.RequestId,
-		result:    ret,
+	sm.idempotentMap[op.ClientKey] = Clerkstate{
+		LastReqId: op.RequestId,
+		Result:    ret,
 	}
 	return
+}
+
+// create a snapshot for state machine
+func (sm *stateMachine) snapshot() (int, []byte) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(sm.cache)
+	e.Encode(sm.idempotentMap)
+	e.Encode(sm.commitIdx)
+
+	return sm.commitIdx, w.Bytes()
+}
+
+// restore  state machine's status to snapshot
+func (sm *stateMachine) applySnap(snapshot []byte) {
+	if len(snapshot) == 0 {
+		return
+	}
+
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var cache map[string]string
+	var idempotentMap map[string]Clerkstate
+	var commitIdx int
+
+	if d.Decode(&cache) != nil || d.Decode(&idempotentMap) != nil ||
+		d.Decode(&commitIdx) != nil {
+		panic("applySnap Decode error")
+	} else {
+		sm.mutex.Lock()
+		if sm.commitIdx < commitIdx {
+			sm.cache = cache
+			sm.idempotentMap = idempotentMap
+			sm.commitIdx = commitIdx
+		}
+		sm.mutex.Unlock()
+	}
 }
 
 // servers[] contains the ports of the set of
@@ -294,14 +356,22 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.pending = make(map[string]chan string)
 
-	// create state machine
 	kv.sm = &stateMachine{
 		cache:         make(map[string]string),
-		idempotentMap: make(map[string]clerkstate),
+		idempotentMap: make(map[string]Clerkstate),
+		commitIdx:     0,
 	}
+
+	// restore state machine
+	snapshot := persister.ReadSnapshot()
+	kv.sm.applySnap(snapshot)
 
 	// comsume message queue applyCh
 	go kv.consumeTicker(applyCh)
+
+	if maxraftstate != -1 {
+		go kv.snapshotTicker(persister, maxraftstate)
+	}
 
 	return kv
 }

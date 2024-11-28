@@ -194,7 +194,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		DPrintf("%v End Snapshot index(%v) %v\n", rf.me, index, Raft2string(rf))
 	}()
 
-	if rf.LastApplied < index || rf.snapshotIndex > index {
+	if rf.snapshotIndex > index {
+		return
+	}
+	if rf.LastApplied < index {
 		// this part of entries (logs[rf.LastApplied+1:index] ) has not been committed
 		panic("Snapshot: fast fail")
 	}

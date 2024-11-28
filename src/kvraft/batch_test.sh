@@ -1,32 +1,34 @@
 #!/bin/bash
 
-rm -rf ./tmpout
-mkdir ./tmpout
+suffix="test3"
 
-# Lab4A
-for i in {1..10}; do 
-    go test -run 4A -v >> ./tmpout/result4A_1.txt;
+rm -rf ./tmpout/result${suffix}*
+mkdir ./tmpout/result${suffix}*
+
+# test
+for i in {1..50}; do 
+    go test -v >> "./tmpout/result${suffix}_1.txt";
 done  &
 
 echo $!
 
-# Lab4A
-for i in {1..10}; do 
-    go test -run 4A -v >> ./tmpout/result4A_2.txt;
+# test
+for i in {1..50}; do 
+    go test -v >> "./tmpout/result${suffix}_2.txt";
 done  &
 
 echo $!
 
-# Lab4A
-for i in {1..10}; do 
-    go test -run 4A -v >> ./tmpout/result4A_3.txt;
+# test
+for i in {1..50}; do 
+    go test -v >> "./tmpout/result${suffix}_3.txt";
 done  &
 
 echo $!
 
-# Lab4A
-for i in {1..10}; do 
-    go test -run 4A -v >> ./tmpout/result4A_4.txt;
+# test
+for i in {1..50}; do 
+    go test -v >> "./tmpout/result${suffix}_4.txt";
 done  &
 
 echo $!

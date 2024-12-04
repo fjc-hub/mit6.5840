@@ -1,5 +1,7 @@
 package shardctrler
 
+import "fmt"
+
 //
 // Shard controller: assigns shards to replication groups.
 //
@@ -35,7 +37,9 @@ const (
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers   map[int][]string // new GID -> servers mappings
+	ClerkKey  string
+	RequestId int
 }
 
 type JoinReply struct {
@@ -44,7 +48,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs      []int
+	ClerkKey  string
+	RequestId int
 }
 
 type LeaveReply struct {
@@ -53,8 +59,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard     int
+	GID       int
+	ClerkKey  string
+	RequestId int
 }
 
 type MoveReply struct {
@@ -63,7 +71,9 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num       int // desired config number
+	ClerkKey  string
+	RequestId int
 }
 
 type QueryReply struct {
@@ -71,3 +81,16 @@ type QueryReply struct {
 	Err         Err
 	Config      Config
 }
+
+func getMuxTag(clerkKey string, requestId int) string {
+	return fmt.Sprintf("%v%v", clerkKey, requestId)
+}
+
+type OpType int
+
+const (
+	OP_JOIN OpType = iota
+	OP_LEAVE
+	OP_MOVE
+	OP_QUERY
+)
